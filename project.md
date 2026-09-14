@@ -563,6 +563,46 @@ lerobot-train ... --policy.type=pi0 --peft.type=lora
 
 **一句话结论**:除 `fastwam` 外所有 20+ 模型都能训。最佳定位是 `act`/`smolvla`/`diffusion` 全量训练 + π0 级大模型微调;128GB 大内存 + `async_inference/` 也使 Spark 非常适合本地部署推理(policy server)。
 
+### 9.1c 多台 DGX Spark 级联训练 LingBot-VA 评估
+
+**级联能力**:NVIDIA 官方规格 —— ConnectX-7 网络支持**最多 4 台** DGX Spark 级联(200 Gbps ≈ 25 GB/s 节点间带宽)。
+
+**LingBot-VA 模型构成**(源码 `policies/lingbot_va/` 实测):可训练 DiT 主干 **~5B 参数**(Wan2.2 双流 transformer,30 层)+ 冻结权重 ~20GB(Wan2.2 VAE + UMT5-XXL 文本编码器,统一内存同一物理池)。
+
+**全量微调内存账**(AdamW + bf16 混合精度):
+
+| 项目 | 占用 |
+|---|---|
+| fp32 权重(Accelerate bf16 模式保留 fp32 主权重) | 20 GB |
+| fp32 梯度 | 20 GB |
+| AdamW 动量 (m+v) | 40 GB |
+| 冻结 VAE + UMT5 | ~20 GB |
+| 激活值(30 层视频 DiT,长序列) | ~10-20 GB |
+| **合计** | **~110-130 GB** |
+
+**结论**:
+
+| 配置 | 总内存 | 判定 |
+|---|---|---|
+| 1 台 Spark | 128 GB | ❌ 贴着上限,实际 batch 必 OOM |
+| **2 台 Spark(FSDP2 分片)** | 256 GB | ✅ **最低可行配置**,每节点 ~55GB,从容 |
+| 4 台 Spark(官方上限) | 512 GB | ✅ 富余,可加大 batch/关闭激活检查点 |
+
+**答案:全量微调至少 2 台,推荐 2-4 台。**
+
+```bash
+# 双机 FSDP2 分片(LeRobot 原生支持)
+torchrun --nnodes=2 --nproc-per-node=1 $(which lerobot-train) \
+  --policy.type=lingbot_va \
+  --parallelism.dp_shard=2 \
+  --accelerator.mixed_precision=bf16 ...
+```
+
+**两个现实警告**:
+
+1. **速度**:节点间 ConnectX-7 为 200 Gbps(~25 GB/s),FSDP 每步需 all-gather 20GB 参数,仅通信就 ~1-2s/步;叠加本地 273 GB/s 带宽瓶颈,视频扩散模型训练会**非常慢**(预计比 8×A100 慢一个数量级)。
+2. **更务实的选择**:单台 Spark + `--peft.type=lora` —— 可训练状态从 80GB 骤降至 <5GB,轻松装下,速度也可接受。全量微调只在确有必要时才上集群。
+
 ### 9.2 训练步数怎么定?(以 epoch 为思考单位)
 
 模仿学习通常 **5-10 个 epoch** 收敛,不是几十万步蛮跑:
